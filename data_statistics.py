@@ -15,6 +15,7 @@ import random
 import numpy as np
 from tqdm import tqdm
 import sys
+import cv2
 
 import torch
 import torch.nn.functional as F
@@ -140,9 +141,140 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+def robust_statistics_perturbation(model,train_dev_loader,train_set_len,device,use_cur_preds=True):
+    pbar = tqdm(train_dev_loader)
+    model.eval()
+    statistics = {}
+    for i in range(train_set_len):
+        statistics[i] = {}
 
-def
+    data_index = 0
+    for model_inputs, labels in pbar:
+        model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+        labels = labels.to(device)
+        logits = model(**model_inputs).logits
+        _, preds = logits.max(dim=-1)
+        for i in range(len(labels)):
+            cur_logits = logits[i]
+            cur_label = labels[i]
+            cur_pred = preds[i]
+            if use_cur_preds:
+                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0), cur_pred.unsqueeze(0))
+            else:
+                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0),cur_label.unsqueeze(0))
+            cur_loss = torch.mean(cur_losses)
+            statistics[data_index]["golden_label"] = cur_label.item()
+            statistics[data_index]["original_loss"] = cur_loss.item()
+            statistics[data_index]["original_pred"] = (cur_label.item()==cur_pred.item())
+            statistics[data_index]["original_logit"] = cur_logits[cur_label.item()].item()
+            statistics[data_index]["original_probability"] = nn.Softmax(dim=-1)(cur_logits)[cur_label.item()].item()
 
+            data_index+=1
+        pbar.set_description("Doing original statistics")
+        # pass
+
+    data_index = 0
+    model.train()
+    pbar = tqdm(train_dev_loader)
+
+    for model_inputs, labels in pbar:
+        model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+
+        labels = labels.to(device)
+
+        if use_cur_preds:
+
+            cur_batch_logits = model(**model_inputs).logits
+            _, cur_batch_preds = cur_batch_logits.max(dim=-1)
+
+        model.zero_grad()
+        # for freelb
+        word_embedding_layer = model.get_input_embeddings()
+        input_ids = model_inputs['pixel_values']
+        # attention_mask = model_inputs['attention_mask']
+
+        embedding_init = word_embedding_layer(input_ids)
+
+        # initialize delta
+        # if args.adv_init_mag > 0:
+        #     input_mask = attention_mask.to(embedding_init)
+        #     input_lengths = torch.sum(input_mask, 1)
+        #     if args.adv_norm_type == 'l2':
+        #         delta = torch.zeros_like(embedding_init).uniform_(-1, 1) * input_mask.unsqueeze(
+        #             2)
+        #         dims = input_lengths * embedding_init.size(-1)
+        #         magnitude = args.adv_init_mag / torch.sqrt(dims)
+        #         delta = (delta * magnitude.view(-1, 1, 1))
+        #     elif args.adv_norm_type == 'linf':
+        #         delta = torch.zeros_like(embedding_init).uniform_(-args.adv_init_mag,
+        #                                                           args.adv_init_mag) * input_mask.unsqueeze(2)
+        # else:
+        # delta = torch.zeros_like(embedding_init)
+        # print(input_ids.shape)
+        # transformed_batch = []
+        transformed_batch = torch.empty_like(input_ids)
+        for i in range(input_ids.shape[0]):
+            blurred = cv2.blur(input_ids[i].permute(1, 2, 0).detach().cpu().numpy(), (5, 5))
+            transformed_batch[i] = torch.from_numpy(blurred).permute(2, 0, 1)
+            #transformed = torch.from_numpy(blurred).permute(2, 0, 1).unsqueeze(0)
+            # print(transformed.shape)
+            #transformed_batch.append(transformed)
+            # print(transformed.shape)
+        #print(transformed_batch)
+        #temp = np.array(transformed_batch)
+        #print(temp.shape)
+        #transformed_batch = torch.vstack(torch.from_numpy(np.array(transformed_batch)))
+        # print(transformed_batch.shape)
+        batch = {'pixel_values': transformed_batch}
+        # total_loss = 0.0
+
+
+        # for astep in range(args.adv_steps):
+        #     # 0. forward
+        #     delta.requires_grad_()
+        #     batch = {'inputs_embeds': delta + embedding_init, 'attention_mask': attention_mask}
+        logits = model(**batch, return_dict=False)[0]
+        _, preds = logits.max(dim=-1)
+        # 1.
+        if use_cur_preds:
+            losses = F.cross_entropy(logits, cur_batch_preds.squeeze(-1))
+        else:
+            losses = F.cross_entropy(logits, labels.squeeze(-1))
+        # losses = F.cross_entropy(logits, labels.squeeze(-1))
+        loss = torch.mean(losses)
+        loss = loss / args.adv_steps
+        # total_loss += loss.item()
+        # loss.backward()
+        #
+        #     if astep == args.adv_steps - 1:
+
+        for i in range(len(labels)):
+            cur_logits = logits[i]
+            cur_label = labels[i]
+            cur_pred = preds[i]
+            if use_cur_preds:
+                cur_batch_pred = cur_batch_preds[i]
+                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0), cur_batch_pred.unsqueeze(0))
+            else:
+                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0), cur_label.unsqueeze(0))
+            cur_loss = torch.mean(cur_losses)
+            statistics[data_index]["after_perturb_loss"] = cur_loss.item()
+            statistics[data_index]["after_perturb_pred"] = (cur_label.item() == cur_pred.item())
+
+            statistics[data_index]["after_perturb_logit"] = cur_logits[cur_label.item()].item()
+            statistics[data_index]["after_perturb_probability"] = nn.Softmax(dim=-1)(cur_logits)[
+                cur_label.item()].item()
+
+            statistics[data_index]["logit_diff"] = statistics[data_index]["after_perturb_logit"] - statistics[data_index]["original_logit"]
+            statistics[data_index]["probability_diff"] = statistics[data_index]["after_perturb_probability"] - statistics[data_index]["original_probability"]
+
+            statistics[data_index]["loss_diff"] = statistics[data_index]["after_perturb_loss"] - statistics[data_index]["original_loss"]
+            statistics[data_index]["normed_loss_diff"] = statistics[data_index]["loss_diff"]
+                                                         #/ delta.norm(p=2,dim=(1,2),keepdim=False)[i].item()
+            data_index += 1
+        # break
+        pbar.set_description("Doing perturbation statistics")
+    return statistics
 
 
 
@@ -735,9 +867,11 @@ def finetune(args):
                                                                       train_set_len=len(train_dataset), device=device,
                                                                       use_cur_preds=args.use_cur_preds)
                         else:
-                            cur_robust_statistics = robust_statistics(model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
+                            cur_robust_statistics = robust_statistics_perturbation(model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
+                                #robust_statistics(model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
 
                         robust_statistics_dict[global_step] = cur_robust_statistics
+                        print('robust stats updated')
                 else:
                     if global_step % int(args.statistic_interval * epoch_steps) == 0 and global_step!=0:
                         if args.use_fgsm:
@@ -746,10 +880,10 @@ def finetune(args):
                                                                            device=device,
                                                                            use_cur_preds=args.use_cur_preds)
                         else:
-                            cur_robust_statistics = robust_statistics(model, train_dev_loader,
-                                                                      train_set_len=len(train_dataset), device=device,
-                                                                      use_cur_preds=args.use_cur_preds)
+                            cur_robust_statistics = robust_statistics_perturbation(model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
+                                #robust_statistics(model, train_dev_loader, train_set_len=len(train_dataset), device=device, use_cur_preds=args.use_cur_preds)
                         robust_statistics_dict[global_step] = cur_robust_statistics
+                        print('robust stats updated')
 
                 batch_loss=0
                 model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
@@ -825,7 +959,7 @@ def finetune(args):
                     robust_statistics_dict)
             else:
                 np.save('robust_statistics_model{}_dataset{}_task{}_seed{}_shuffle{}_len{}_adv_steps{}_adv_lr{}_epoch{}_lr{}_interval{}_with_untrained_model{}_use_cur_preds{}.npy'
-                        .format(args.model_name,args.dataset_name,args.task_name,args.seed,args.do_train_shuffle,
+                        .format(args.model_name.split('/')[-1],args.dataset_name,args.task_name,args.seed,args.do_train_shuffle,
                                 args.dataset_len,
                                 args.adv_steps,args.adv_lr,args.epochs,args.lr,
                                 args.statistic_interval,args.with_untrained_model,args.use_cur_preds
@@ -835,6 +969,7 @@ def finetune(args):
             np.save(args.output_dir,robust_statistics_dict)
     except KeyboardInterrupt:
         logger.info('Interrupted...')
+
 
 if __name__ == '__main__':
     args = parse_args()

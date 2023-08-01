@@ -55,6 +55,11 @@ def dataset_to_length_and_batch_size(dataset_name="glue",task_name="sst2"):
             len_dataset = 392702
             per_device_batch_size = 32
             return len_dataset, per_device_batch_size
+    elif dataset_name == 'cifar10':
+        len_dataset = 50000
+        per_device_batch_size = 32
+        return len_dataset, per_device_batch_size
+
 
 
 
@@ -158,8 +163,8 @@ if __name__ == '__main__':
     Choose your dataset and specify your statistic path, and plot
     """
 
-    len_dataset,_ = dataset_to_length_and_batch_size("imdb", None)
-    your_path = "../robust_statistics_modelbert-base-uncased_datasetimdb_taskNone_seed42_shuffle1_lenNone_adv_steps5_adv_lr0.03_epoch10_lr2e-05_interval1_with_untrained_model1_use_cur_preds0.npy"
+    len_dataset,_ = dataset_to_length_and_batch_size("cifar10", None)
+    your_path = "../robust_statistics_modelvit-base-patch16-224_datasetcifar10_taskNone_seed42_shuffle1_lenNone_adv_steps5_adv_lr0.03_epoch1_lr2e-05_interval1_with_untrained_model1_use_cur_preds0.npy"
     new_data_loss_diff, new_data_original_correctness, new_data_flip_times, \
     new_data_delta_grad, new_data_original_loss, new_data_perturbed_loss, new_data_original_logit, \
     new_data_perturbed_logit, new_data_logit_diff, new_data_original_probability, \
