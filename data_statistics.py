@@ -20,6 +20,10 @@ import cv2
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+import torch.nn.parallel
+import torch.utils.data.distributed
+import torch.multiprocessing as mp
 from torch.optim.lr_scheduler import LambdaLR
 from torchvision.datasets import CIFAR10
 import torchvision.transforms as transforms
@@ -62,6 +66,21 @@ def parse_args():
     parser.add_argument('--bsz', type=int, default=32)
     parser.add_argument('--eval_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=1)
+    # parser.add_argument('--world-size', default=-1, type=int,
+    #                     help='number of nodes for distributed training')
+    # parser.add_argument('--rank', default=-1, type=int,
+    #                     help='node rank for distributed training')
+    # parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+    #                     help='url used to set up distributed training')
+    # parser.add_argument('--dist-backend', default='nccl', type=str,
+    #                     help='distributed backend')
+    # parser.add_argument('--gpu', default=None, type=int,
+    #                     help='GPU id to use.')
+    # parser.add_argument('--multiprocessing-distributed', action='store_true',
+    #                     help='Use multi-processing distributed training to launch '
+    #                          'N processes per node, which has N GPUs. This is the '
+    #                          'fastest way to use PyTorch for either single node or '
+    #                          'multi node data parallel training')
     parser.add_argument('--lr', type=float, default=2e-5)
     parser.add_argument('--weight_decay', default=1e-2, type=float)  # BERT default
     parser.add_argument("--adam_epsilon", default=1e-8, type=float, help="Epsilon for Adam optimizer.")  # BERT default
@@ -141,7 +160,7 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def robust_statistics_perturbation(model,train_dev_loader,train_set_len,device,use_cur_preds=True):
+def robust_statistics_perturbation(model, train_dev_loader, train_set_len, device, use_cur_preds=True):
     pbar = tqdm(train_dev_loader)
     model.eval()
     statistics = {}
@@ -154,7 +173,7 @@ def robust_statistics_perturbation(model,train_dev_loader,train_set_len,device,u
         labels = labels.to(device)
         logits = model(**model_inputs).logits
         _, preds = logits.max(dim=-1)
-        for i in range(len(labels)):
+        for i in range(len(labels))[:2]:
             cur_logits = logits[i]
             cur_label = labels[i]
             cur_pred = preds[i]
@@ -170,6 +189,8 @@ def robust_statistics_perturbation(model,train_dev_loader,train_set_len,device,u
             statistics[data_index]["original_probability"] = nn.Softmax(dim=-1)(cur_logits)[cur_label.item()].item()
 
             data_index+=1
+            break
+        break
         pbar.set_description("Doing original statistics")
         # pass
 
@@ -272,7 +293,9 @@ def robust_statistics_perturbation(model,train_dev_loader,train_set_len,device,u
             statistics[data_index]["normed_loss_diff"] = statistics[data_index]["loss_diff"]
                                                          #/ delta.norm(p=2,dim=(1,2),keepdim=False)[i].item()
             data_index += 1
-        # break
+            break
+        break
+
         pbar.set_description("Doing perturbation statistics")
     return statistics
 
@@ -701,7 +724,23 @@ def transform(example_batch):
 
 
 def finetune(args):
+        # gpu, ngpus_per_node, args):
     set_seed(args.seed)
+    # args.gpu = gpu
+    # if args.gpu is not None:
+    #     print("Use GPU: {} for training".format(args.gpu))
+    #
+    # if args.distributed:
+    #     if args.dist_url == "env://" and args.rank == -1:
+    #         args.rank = int(os.environ["RANK"])
+    #     if args.multiprocessing_distributed:
+    #         # For multiprocessing distributed training, rank needs to be the
+    #         # global rank among all the processes
+    #         args.rank = args.rank * ngpus_per_node + gpu
+    #     dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+    #                             world_size=args.world_size, rank=args.rank)
+    #
+
     # output_dir = Path(args.output_dir)
     # if not output_dir.exists():
     #     logger.info(f'Making checkpoint directory: {output_dir}')
@@ -769,31 +808,88 @@ def finetune(args):
         train_dataset = load_dataset('cifar10', split='train')
         #print(train_dataset[0])
         train_dataset = train_dataset.with_transform(preprocess_train)
-        logger.info("train dataset length: "+ str(len(train_dataset)))
-        train_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=args.do_train_shuffle
-                , collate_fn=collator
-                )
-        train_dev_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=False, collate_fn=collator)
-        train_dev_dict = {}
-        labels = train_dataset.features["label"].names
-        label2id = {label: str(i) for i, label in enumerate(labels)}
-        id2label = {str(i): label for i, label in enumerate(labels)}
-        config = AutoConfig.from_pretrained(args.model_name, num_labels=len(labels), i2label=id2label, label2id=label2id, finetuning_task="image-classification")
-        model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224-in21k", config=config)
-        model.to(device)
-        print(model)
-        #dev_dataset = utils.VisionDataset(args, name_or_dataset=args.dataset_name, split="test")
-        #dev_dataset = CIFAR10('data', train=False, transform=transforms.Compose([transforms.ToTensor()]), download=True)
+
         dev_dataset = load_dataset('cifar10', split='test')
         dev_dataset = dev_dataset.with_transform(preprocess_dev)
-        dev_loader = DataLoader(dev_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator)
+        #
+        # if args.distributed:
+        #     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        #     dev_sampler = torch.utils.data.distributed.DistributedSampler(dev_dataset, shuffle=False, drop_last=True)
+        # else:
+        train_sampler = None
+        dev_sampler = None
+
+        logger.info("train dataset length: "+ str(len(train_dataset)))
+        train_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=args.do_train_shuffle
+                , collate_fn=collator, sampler=train_sampler
+                )
+        train_dev_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=False, collate_fn=collator)
+        dev_loader = DataLoader(dev_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator, sampler=dev_sampler)
         logger.info("dev dataset length: "+ str(len(dev_dataset)))
 
         if args.do_test:
             #test_dataset = utils.VisionDataset(args, name_or_dataset=args.dataset_name, split='test')
             #test_dataset = CIFAR10(data, train=False, transform=transforms.Compose([transforms.ToTensor()]), download=True)
             test_dataset = load_dataset('cifar10', split='test')
-            test_loader = DataLoader(test_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator) 
+            test_loader = DataLoader(test_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator, sampler=dev_sampler)
+
+        train_dev_dict = {}
+        labels = train_dataset.features["label"].names
+        label2id = {label: str(i) for i, label in enumerate(labels)}
+        id2label = {str(i): label for i, label in enumerate(labels)}
+        config = AutoConfig.from_pretrained(args.model_name, num_labels=len(labels), i2label=id2label, label2id=label2id, finetuning_task="image-classification")
+        model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224-in21k", config=config)
+        #
+        #
+        # if args.distributed:
+        #     # For multiprocessing distributed, DistributedDataParallel constructor
+        #     # should always set the single device scope, otherwise,
+        #     # DistributedDataParallel will use all available devices.
+        #     if torch.cuda.is_available():
+        #         if args.gpu is not None:
+        #             torch.cuda.set_device(args.gpu)
+        #             model.cuda(args.gpu)
+        #             # When using a single GPU per process and per
+        #             # DistributedDataParallel, we need to divide the batch size
+        #             # ourselves based on the total number of GPUs of the current node.
+        #             args.batch_size = int(args.batch_size / ngpus_per_node)
+        #             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+        #             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        #         else:
+        #             model.cuda()
+        #             # DistributedDataParallel will divide and allocate batch_size to all
+        #             # available GPUs if device_ids are not set
+        #             model = torch.nn.parallel.DistributedDataParallel(model)
+        # elif args.gpu is not None and torch.cuda.is_available():
+        #     torch.cuda.set_device(args.gpu)
+        #     model = model.cuda(args.gpu)
+        # elif torch.backends.mps.is_available():
+        #     device = torch.device("mps")
+        #     model = model.to(device)
+        # else:
+        #     # DataParallel will divide and allocate batch_size to all available GPUs
+        #     if args.model_name.startswith('alexnet') or args.model_name.startswith('vgg'):
+        #         model.features = torch.nn.DataParallel(model.features)
+        #         model.cuda()
+        #     else:
+        #         model = torch.nn.DataParallel(model).cuda()
+        #
+        # if torch.cuda.is_available():
+        #     if args.gpu:
+        #         device = torch.device('cuda:{}'.format(args.gpu))
+        #     else:
+        #         device = torch.device("cuda")
+        # elif torch.backends.mps.is_available():
+        #     device = torch.device("mps")
+        # else:
+        #     device = torch.device("cpu")
+
+
+        model.to(device)
+        print(model)
+        #dev_dataset = utils.VisionDataset(args, name_or_dataset=args.dataset_name, split="test")
+        #dev_dataset = CIFAR10('data', train=False, transform=transforms.Compose([transforms.ToTensor()]), download=True)
+
 
     else:
 
@@ -853,6 +949,8 @@ def finetune(args):
         best_accuracy = 0
         global_step = 0
         for epoch in range(args.epochs):
+            # if args.distributed:
+            #     train_sampler.set_epoch(epoch)
             avg_loss = utils.ExponentialMovingAverage()
             model.train()
             pbar = tqdm(train_loader)
@@ -887,9 +985,10 @@ def finetune(args):
 
                 batch_loss=0
                 model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+                model_inputs = model_inputs['pixel_values']
                 labels = labels.to(device)
                 model.zero_grad()
-                logits = model(**model_inputs,return_dict=False)[0]
+                logits = model(model_inputs,return_dict=False)[0]
                 _, preds = logits.max(dim=-1)
 
                 losses = F.cross_entropy(logits,labels.squeeze(-1))
@@ -925,8 +1024,9 @@ def finetune(args):
                 with torch.no_grad():
                     for model_inputs, labels in dev_loader:
                         model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+                        model_inputs = model_inputs['pixel_values']
                         labels = labels.to(device)
-                        logits = model(**model_inputs,return_dict=False)[0]
+                        logits = model(model_inputs,return_dict=False)[0]
                         _, preds = logits.max(dim=-1)
                         correct += (preds == labels.squeeze(-1)).sum().item()
                         total += labels.size(0)
@@ -943,7 +1043,9 @@ def finetune(args):
                     # torch.save(args, os.path.join(output_dir, "training_args.bin"))
                     best_accuracy = accuracy
                     best_dev_epoch = epoch
-            # logger.info(f'Best dev metric: {best_accuracy} in Epoch: {best_dev_epoch}')
+
+            logger.info(f'Best dev metric: {best_accuracy} in Epoch: {best_dev_epoch}')
+
         # save statistics
 
 
@@ -979,5 +1081,25 @@ if __name__ == '__main__':
     else:
         level = logging.INFO
     logging.basicConfig(level=level)
+    # if args.dist_url == "env://" and args.world_size == -1:
+    #     args.world_size = int(os.environ["WORLD_SIZE"])
+    #
+    # args.distributed = args.world_size > 1 or args.multiprocessing_distributed
+    #
+    # if torch.cuda.is_available():
+    #     ngpus_per_node = torch.cuda.device_count()
+    # else:
+    #     ngpus_per_node = 1
+    # if args.multiprocessing_distributed:
+    #     # Since we have ngpus_per_node processes per node, the total world_size
+    #     # needs to be adjusted accordingly
+    #     args.world_size = ngpus_per_node * args.world_size
+    #     # Use torch.multiprocessing.spawn to launch distributed processes: the
+    #     # main_worker process function
+    #     mp.spawn(finetune, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+    # else:
+    #     # Simply call main_worker function
+    #     finetune(args.gpu, ngpus_per_node, args)
+
 
     finetune(args)
