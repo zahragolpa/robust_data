@@ -20,7 +20,9 @@ sys.path.append("../../..")
 import matplotlib.pyplot as plt
 from finetune_with_select_data import select_data,sort_df_by_metric
 
-
+import argparse
+parser = argparse.ArgumentParser(description='')
+parser.add_argument('--exp', help='experiment name')
 
 from statistic_utils import *
 
@@ -65,7 +67,7 @@ def dataset_to_length_and_batch_size(dataset_name="glue",task_name="sst2"):
 
 
 # Based on https://github.com/allenai/cartography
-def plot_map(dataframe,max_instances_to_plot,hue_metric="original_correctness",main_metric="loss_diff_mean",other_metric="loss_diff_std",do_round=True,show_hist=True,model="BERT",dataset="SST2"):
+def plot_map(exp_name, dataframe,max_instances_to_plot,hue_metric="original_correctness",main_metric="loss_diff_mean",other_metric="loss_diff_std",do_round=True,show_hist=True,model="BERT",dataset="SST2"):
 
 
     sns.set(style='whitegrid', font_scale=1.6, font='Georgia', context='paper')
@@ -152,7 +154,7 @@ def plot_map(dataframe,max_instances_to_plot,hue_metric="original_correctness",m
         plott2[0].set_ylabel('Density')
 
 
-    plt.savefig("{}.pdf".format(dataset),pad_inches=0)
+    plt.savefig("{}.pdf".format(exp_name),pad_inches=0)
     plt.show()
 
     print()
@@ -162,9 +164,9 @@ if __name__ == '__main__':
     """
     Choose your dataset and specify your statistic path, and plot
     """
-
+    args = parser.parse_args()
     len_dataset,_ = dataset_to_length_and_batch_size("cifar10", None)
-    your_path = "../robust_statistics_modelvit-base-patch16-224_datasetcifar10_taskNone_seed42_shuffle1_lenNone_adv_steps5_adv_lr0.03_epoch1_lr2e-05_interval1_with_untrained_model1_use_cur_preds0.npy"
+    your_path = f"../{args.exp}.npy"
     new_data_loss_diff, new_data_original_correctness, new_data_flip_times, \
     new_data_delta_grad, new_data_original_loss, new_data_perturbed_loss, new_data_original_logit, \
     new_data_perturbed_logit, new_data_logit_diff, new_data_original_probability, \
@@ -193,7 +195,8 @@ if __name__ == '__main__':
     df["Sensitivity"] = df["perturbed_loss_mean"]
     df["Variability"] = df["perturbed_loss_std"]
 
-    plot_map(df,
+    plot_map(args.exp,
+             df,
              # int(df.shape[0]),
              120000,
              hue_metric="Flip Rate",

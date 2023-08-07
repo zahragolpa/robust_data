@@ -12,11 +12,14 @@ import logging
 import os
 from pathlib import Path
 import random
+import json
+import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 import sys
 import cv2
-
+import time
+from transformations import *
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -30,6 +33,9 @@ import torchvision.transforms as transforms
 from transformers import (
     AdamW, AutoConfig, AutoTokenizer, AutoFeatureExtractor, ViTForImageClassification, ViTFeatureExtractor
 )
+from accelerate import Accelerator
+from torch.utils.tensorboard import SummaryWriter
+
 from models.modeliing_bert import BertForSequenceClassification
 from models.modeling_roberta import RobertaForSequenceClassification
 from torch import nn
@@ -38,20 +44,24 @@ sys.path.append("../..")
 sys.path.append("../../..")
 import utils as utils
 from datasets import load_dataset
+from plot_utils.sample_points import get_robust_ind
 # from transformers.models.bert.modeling_bert import BertSelfAttention, BertLayer # modified
 from transformers.models.bert.modeling_bert import BertSelfAttention, BertLayer # modified
 # from modeling_utils import PreTrainedModel
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stdout))
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1,3"
+accelerator = Accelerator()
+device = accelerator.device
 
+writer = SummaryWriter(f'runs/{time.strftime("%c")}')
 
 def parse_args():
     parser = argparse.ArgumentParser()
     # settings
-    parser.add_argument('--model_name', type=str, default='google/vit-base-patch16-224'
-            )
+    parser.add_argument('--model_name', type=str, default='google/vit-base-patch16-224')
+    parser.add_argument('-t', default=None, type=str)
     parser.add_argument("--dataset_name", default='cifar10', type=str)
     parser.add_argument("--task_name", default="None", type=str)
     parser.add_argument('--ckpt_dir', type=Path, default=Path('saved_models'))
@@ -118,10 +128,13 @@ def parse_args():
                         help='change rate of a sentence')
     parser.add_argument('--max_grad_norm', default=1, type=float, help='max gradient norm')
     parser.add_argument('--use_fgsm', default=0, type=float, help='')
-
+    parser.add_argument('--separate_loss', default=True, type=bool, help='log loss based on sample robustness')
+    parser.add_argument('--set_percentage', default=None, type=float, help='what percentage of data should be used (based on robustness -- table 1)')
+    parser.add_argument('--group', default=None, help='robustness group to be used for training')
+    parser.add_argument('--do_robustness', action='store_true', help='do robustness testing')
 
     # robust data statistics
-    parser.add_argument('--statistic_interval', default=1, type=float, help='')
+    parser.add_argument('--statistic_interval', default=0.35, type=float, help='')
     parser.add_argument('--dataset_len', default=None, type=int, help='')
     parser.add_argument('--with_untrained_model', default=1, type=int, help='')
     parser.add_argument('--use_cur_preds', default=0, type=int, help='whether use cur predictions or golden labels to calculate loss')
@@ -158,146 +171,6 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
         )
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
-
-
-def robust_statistics_perturbation(model, train_dev_loader, train_set_len, device, use_cur_preds=True):
-    pbar = tqdm(train_dev_loader)
-    model.eval()
-    statistics = {}
-    for i in range(train_set_len):
-        statistics[i] = {}
-
-    data_index = 0
-    for model_inputs, labels in pbar:
-        model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
-        labels = labels.to(device)
-        logits = model(**model_inputs).logits
-        _, preds = logits.max(dim=-1)
-        for i in range(len(labels))[:2]:
-            cur_logits = logits[i]
-            cur_label = labels[i]
-            cur_pred = preds[i]
-            if use_cur_preds:
-                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0), cur_pred.unsqueeze(0))
-            else:
-                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0),cur_label.unsqueeze(0))
-            cur_loss = torch.mean(cur_losses)
-            statistics[data_index]["golden_label"] = cur_label.item()
-            statistics[data_index]["original_loss"] = cur_loss.item()
-            statistics[data_index]["original_pred"] = (cur_label.item()==cur_pred.item())
-            statistics[data_index]["original_logit"] = cur_logits[cur_label.item()].item()
-            statistics[data_index]["original_probability"] = nn.Softmax(dim=-1)(cur_logits)[cur_label.item()].item()
-
-            data_index+=1
-            break
-        break
-        pbar.set_description("Doing original statistics")
-        # pass
-
-    data_index = 0
-    model.train()
-    pbar = tqdm(train_dev_loader)
-
-    for model_inputs, labels in pbar:
-        model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
-
-        labels = labels.to(device)
-
-        if use_cur_preds:
-
-            cur_batch_logits = model(**model_inputs).logits
-            _, cur_batch_preds = cur_batch_logits.max(dim=-1)
-
-        model.zero_grad()
-        # for freelb
-        word_embedding_layer = model.get_input_embeddings()
-        input_ids = model_inputs['pixel_values']
-        # attention_mask = model_inputs['attention_mask']
-
-        embedding_init = word_embedding_layer(input_ids)
-
-        # initialize delta
-        # if args.adv_init_mag > 0:
-        #     input_mask = attention_mask.to(embedding_init)
-        #     input_lengths = torch.sum(input_mask, 1)
-        #     if args.adv_norm_type == 'l2':
-        #         delta = torch.zeros_like(embedding_init).uniform_(-1, 1) * input_mask.unsqueeze(
-        #             2)
-        #         dims = input_lengths * embedding_init.size(-1)
-        #         magnitude = args.adv_init_mag / torch.sqrt(dims)
-        #         delta = (delta * magnitude.view(-1, 1, 1))
-        #     elif args.adv_norm_type == 'linf':
-        #         delta = torch.zeros_like(embedding_init).uniform_(-args.adv_init_mag,
-        #                                                           args.adv_init_mag) * input_mask.unsqueeze(2)
-        # else:
-        # delta = torch.zeros_like(embedding_init)
-        # print(input_ids.shape)
-        # transformed_batch = []
-        transformed_batch = torch.empty_like(input_ids)
-        for i in range(input_ids.shape[0]):
-            blurred = cv2.blur(input_ids[i].permute(1, 2, 0).detach().cpu().numpy(), (5, 5))
-            transformed_batch[i] = torch.from_numpy(blurred).permute(2, 0, 1)
-            #transformed = torch.from_numpy(blurred).permute(2, 0, 1).unsqueeze(0)
-            # print(transformed.shape)
-            #transformed_batch.append(transformed)
-            # print(transformed.shape)
-        #print(transformed_batch)
-        #temp = np.array(transformed_batch)
-        #print(temp.shape)
-        #transformed_batch = torch.vstack(torch.from_numpy(np.array(transformed_batch)))
-        # print(transformed_batch.shape)
-        batch = {'pixel_values': transformed_batch}
-        # total_loss = 0.0
-
-
-        # for astep in range(args.adv_steps):
-        #     # 0. forward
-        #     delta.requires_grad_()
-        #     batch = {'inputs_embeds': delta + embedding_init, 'attention_mask': attention_mask}
-        logits = model(**batch, return_dict=False)[0]
-        _, preds = logits.max(dim=-1)
-        # 1.
-        if use_cur_preds:
-            losses = F.cross_entropy(logits, cur_batch_preds.squeeze(-1))
-        else:
-            losses = F.cross_entropy(logits, labels.squeeze(-1))
-        # losses = F.cross_entropy(logits, labels.squeeze(-1))
-        loss = torch.mean(losses)
-        loss = loss / args.adv_steps
-        # total_loss += loss.item()
-        # loss.backward()
-        #
-        #     if astep == args.adv_steps - 1:
-
-        for i in range(len(labels)):
-            cur_logits = logits[i]
-            cur_label = labels[i]
-            cur_pred = preds[i]
-            if use_cur_preds:
-                cur_batch_pred = cur_batch_preds[i]
-                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0), cur_batch_pred.unsqueeze(0))
-            else:
-                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0), cur_label.unsqueeze(0))
-            cur_loss = torch.mean(cur_losses)
-            statistics[data_index]["after_perturb_loss"] = cur_loss.item()
-            statistics[data_index]["after_perturb_pred"] = (cur_label.item() == cur_pred.item())
-
-            statistics[data_index]["after_perturb_logit"] = cur_logits[cur_label.item()].item()
-            statistics[data_index]["after_perturb_probability"] = nn.Softmax(dim=-1)(cur_logits)[
-                cur_label.item()].item()
-
-            statistics[data_index]["logit_diff"] = statistics[data_index]["after_perturb_logit"] - statistics[data_index]["original_logit"]
-            statistics[data_index]["probability_diff"] = statistics[data_index]["after_perturb_probability"] - statistics[data_index]["original_probability"]
-
-            statistics[data_index]["loss_diff"] = statistics[data_index]["after_perturb_loss"] - statistics[data_index]["original_loss"]
-            statistics[data_index]["normed_loss_diff"] = statistics[data_index]["loss_diff"]
-                                                         #/ delta.norm(p=2,dim=(1,2),keepdim=False)[i].item()
-            data_index += 1
-            break
-        break
-
-        pbar.set_description("Doing perturbation statistics")
-    return statistics
 
 
 
@@ -673,9 +546,9 @@ def preprocess_dev(example_batch):
     dev_transforms = transforms.Compose(
         [
             transforms.Resize(size),
-            transforms.CenterCrop(size),
+            # transforms.CenterCrop(size),
             transforms.ToTensor(),
-            normalize,
+            # normalize,
         ]
     )
     example_batch["pixel_values"] = [dev_transforms(image.convert("RGB")) for image in example_batch["img"]]
@@ -692,15 +565,17 @@ def preprocess_train(example_batch):
     train_transforms = transforms.Compose(
         [
             #transforms.ToPILImage(),
-            transforms.RandomResizedCrop(size),
-            transforms.RandomHorizontalFlip(),
+            transforms.Resize(size),
+            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            normalize,
+            # normalize,
         ]
     )
 
-    example_batch["pixel_values"] = [train_transforms(image.convert("RGB")) for image in example_batch["img"]]
-    #print(f'type of example batch {type(example_batch["pixel_values"][0])}')
+    # example_batch["pixel_values"] = [train_transforms(image.convert("RGB")) for image in example_batch["img"]]
+    example_batch["pixel_values"] = [train_transforms(image) for image in example_batch["img"]]
+
+#print(f'type of example batch {type(example_batch["pixel_values"][0])}')
     return example_batch
 
 
@@ -723,9 +598,194 @@ def transform(example_batch):
     return inputs
 
 
+def calc_loss(loader, epoch, model, name, args):
+    vis = False
+    pbar = tqdm(loader)
+    model.train()
+    func = globals()[args.t]
+    t_min, t_max = get_t_range(args.t)
+    t_max = t_max / 2
+    intensity = t_min + epoch * (t_max - t_min) / 10
+    experiment_name = f'{args.dataset_name}_epochs_{args.epochs}_lr_{args.lr}_bsz_{args.bsz}_t_{args.t}_dynamic'
+
+    for model_inputs, labels in pbar:
+        model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+        labels = labels.to(device)
+
+        cur_batch_logits = model(**model_inputs).logits
+        _, cur_batch_preds = cur_batch_logits.max(dim=-1)
+
+        model.zero_grad()
+        # for freelb
+        input_ids = model_inputs['pixel_values']
+
+        if epoch == 0 and not vis:
+            vis = True
+            writer.add_images(name, input_ids)
+
+        transformed_batch = torch.empty_like(input_ids)
+        for i in range(input_ids.shape[0]):
+            transformed = func((255*input_ids[i].permute(1, 2, 0).detach().cpu().numpy()).astype(np.uint8), intensity)
+            transformed_batch[i] = torch.from_numpy(transformed).permute(2, 0, 1)
+        batch = {'pixel_values': transformed_batch}
+
+        logits = model(**batch, return_dict=False)[0]
+        _, preds = logits.max(dim=-1)
+        # 1.
+        # if use_cur_preds:
+        losses = F.cross_entropy(logits, cur_batch_preds.squeeze(-1))
+        # else:
+        #     losses = F.cross_entropy(logits, labels.squeeze(-1))
+        # losses = F.cross_entropy(logits, labels.squeeze(-1))
+        loss = torch.mean(losses)
+        pbar.set_description("Doing perturbation statistics")
+    writer.add_scalar(f'{experiment_name}/AdvLoss/{name}', loss, epoch)
+
+
+def separate_loss(train_dataset, epoch, model, args):
+    experiment_name = f'{args.dataset_name}_epochs_{args.epochs}_lr_{args.lr}_bsz_{args.bsz}_t_{args.t}_dynamic'
+    robust_ind, swing_ind, non_robust_ind = get_robust_ind(f"{experiment_name}.npy", 0.1)
+    robust_loader = DataLoader(torch.utils.data.Subset(train_dataset, robust_ind), batch_size=args.bsz, shuffle=False, collate_fn=collate_fn)
+    swing_loader = DataLoader(torch.utils.data.Subset(train_dataset, swing_ind), batch_size=args.bsz, shuffle=False, collate_fn=collate_fn)
+    non_robust_loader = DataLoader(torch.utils.data.Subset(train_dataset, non_robust_ind), batch_size=args.bsz, shuffle=False, collate_fn=collate_fn)
+    calc_loss(robust_loader, epoch, model, "robust", args)
+    calc_loss(swing_loader, epoch, model, "swing", args)
+    calc_loss(non_robust_loader, epoch, model, "non_robust", args)
+
+
+def robust_statistics_perturbation(epoch, model, train_dev_loader, train_set_len, device, use_cur_preds=True):
+    pbar = tqdm(train_dev_loader)
+    model.eval()
+    statistics = {}
+    func = globals()[args.t]
+    t_min, t_max = get_t_range(args.t)
+    intensity = t_min + epoch * (t_max - t_min) / 10
+    # print(f'intensity {intensity}')
+    for i in range(train_set_len):
+        statistics[i] = {}
+
+    data_index = 0
+    for model_inputs, labels in pbar:
+        model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+        labels = labels.to(device)
+        logits = model(**model_inputs).logits
+        _, preds = logits.max(dim=-1)
+        for i in range(len(labels)):
+            cur_logits = logits[i]
+            cur_label = labels[i]
+            cur_pred = preds[i]
+            if use_cur_preds:
+                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0), cur_pred.unsqueeze(0))
+            else:
+                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0),cur_label.unsqueeze(0))
+            cur_loss = torch.mean(cur_losses)
+            statistics[data_index]["golden_label"] = cur_label.item()
+            statistics[data_index]["original_loss"] = cur_loss.item()
+            statistics[data_index]["original_pred"] = (cur_label.item()==cur_pred.item())
+            statistics[data_index]["original_logit"] = cur_logits[cur_label.item()].item()
+            statistics[data_index]["original_probability"] = nn.Softmax(dim=-1)(cur_logits)[cur_label.item()].item()
+
+            data_index+=1
+        #     break
+        # break
+        pbar.set_description("Doing original statistics")
+        # pass
+
+    data_index = 0
+    model.train()
+    pbar = tqdm(train_dev_loader)
+
+    for model_inputs, labels in pbar:
+        model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+
+        labels = labels.to(device)
+
+        if use_cur_preds:
+
+            cur_batch_logits = model(**model_inputs).logits
+            _, cur_batch_preds = cur_batch_logits.max(dim=-1)
+
+        model.zero_grad()
+        # for freelb
+        # word_embedding_layer = model.get_input_embeddings()
+        input_ids = model_inputs['pixel_values']
+        transformed_batch = torch.empty_like(input_ids)
+        for i in range(input_ids.shape[0]):
+            transformed = func((255*input_ids[i].permute(1, 2, 0).detach().cpu().numpy()).astype(np.uint8), intensity)
+            if i == 0:
+                # print((256*np.array(input_ids[i].permute(1, 2, 0).detach().cpu())).astype(np.uint8))
+                # print(f'******{transformed}******')
+                writer.add_image(f"original_{args.t}_{intensity}", input_ids[i])
+                writer.add_image(f"transformed_{args.t}_{intensity}", transforms.ToTensor()(transformed))
+            transformed_batch[i] = torch.from_numpy(transformed).permute(2, 0, 1)
+            #transformed = torch.from_numpy(blurred).permute(2, 0, 1).unsqueeze(0)
+            # print(transformed.shape)
+            #transformed_batch.append(transformed)
+            # print(transformed.shape)
+        #print(transformed_batch)
+        #temp = np.array(transformed_batch)
+        #print(temp.shape)
+        #transformed_batch = torch.vstack(torch.from_numpy(np.array(transformed_batch)))
+        # print(transformed_batch.shape)
+        batch = {'pixel_values': transformed_batch}
+
+        # total_loss = 0.0
+
+
+        # for astep in range(args.adv_steps):
+        #     # 0. forward
+        #     delta.requires_grad_()
+        #     batch = {'inputs_embeds': delta + embedding_init, 'attention_mask': attention_mask}
+        logits = model(**batch, return_dict=False)[0]
+        _, preds = logits.max(dim=-1)
+        # 1.
+        if use_cur_preds:
+            losses = F.cross_entropy(logits, cur_batch_preds.squeeze(-1))
+        else:
+            losses = F.cross_entropy(logits, labels.squeeze(-1))
+        # losses = F.cross_entropy(logits, labels.squeeze(-1))
+        loss = torch.mean(losses)
+        loss = loss / args.adv_steps
+        # total_loss += loss.item()
+        # loss.backward()
+        #
+        #     if astep == args.adv_steps - 1:
+
+        for i in range(len(labels)):
+            cur_logits = logits[i]
+            cur_label = labels[i]
+            cur_pred = preds[i]
+            if use_cur_preds:
+                cur_batch_pred = cur_batch_preds[i]
+                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0), cur_batch_pred.unsqueeze(0))
+            else:
+                cur_losses = F.cross_entropy(cur_logits.unsqueeze(0), cur_label.unsqueeze(0))
+            cur_loss = torch.mean(cur_losses)
+            statistics[data_index]["after_perturb_loss"] = cur_loss.item()
+            statistics[data_index]["after_perturb_pred"] = (cur_label.item() == cur_pred.item())
+
+            statistics[data_index]["after_perturb_logit"] = cur_logits[cur_label.item()].item()
+            statistics[data_index]["after_perturb_probability"] = nn.Softmax(dim=-1)(cur_logits)[
+                cur_label.item()].item()
+
+            statistics[data_index]["logit_diff"] = statistics[data_index]["after_perturb_logit"] - statistics[data_index]["original_logit"]
+            statistics[data_index]["probability_diff"] = statistics[data_index]["after_perturb_probability"] - statistics[data_index]["original_probability"]
+
+            statistics[data_index]["loss_diff"] = statistics[data_index]["after_perturb_loss"] - statistics[data_index]["original_loss"]
+            statistics[data_index]["normed_loss_diff"] = statistics[data_index]["loss_diff"]
+            #/ delta.norm(p=2,dim=(1,2),keepdim=False)[i].item()
+            data_index += 1
+        #     break
+        # break
+
+        pbar.set_description("Doing perturbation statistics")
+    return statistics
+
+
 def finetune(args):
         # gpu, ngpus_per_node, args):
     set_seed(args.seed)
+    experiment_name = f'{args.dataset_name}_epochs_{args.epochs}_lr_{args.lr}_bsz_{args.bsz}_t_{args.t}_dynamic'
     # args.gpu = gpu
     # if args.gpu is not None:
     #     print("Use GPU: {} for training".format(args.gpu))
@@ -763,7 +823,8 @@ def finetune(args):
         output_mode = 'classification'
 
     # pre-trained config/tokenizer/model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = accelerator.device
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config = AutoConfig.from_pretrained(args.model_name, num_labels=args.num_labels,mirror='tuna')
 
     if args.model_name == 'google/vit-base-patch16-224':
@@ -808,7 +869,6 @@ def finetune(args):
         train_dataset = load_dataset('cifar10', split='train')
         #print(train_dataset[0])
         train_dataset = train_dataset.with_transform(preprocess_train)
-
         dev_dataset = load_dataset('cifar10', split='test')
         dev_dataset = dev_dataset.with_transform(preprocess_dev)
         #
@@ -819,19 +879,35 @@ def finetune(args):
         train_sampler = None
         dev_sampler = None
 
-        logger.info("train dataset length: "+ str(len(train_dataset)))
+
         train_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=args.do_train_shuffle
                 , collate_fn=collator, sampler=train_sampler
                 )
         train_dev_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=False, collate_fn=collator)
         dev_loader = DataLoader(dev_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator, sampler=dev_sampler)
-        logger.info("dev dataset length: "+ str(len(dev_dataset)))
+
+
+        if args.set_percentage:
+            robust_ind, swing_ind, non_robust_ind = get_robust_ind(f"{experiment_name}.npy", args.set_percentage)
+            robust_loader = DataLoader(torch.utils.data.Subset(train_dataset, robust_ind), batch_size=args.bsz, shuffle=False, collate_fn=collate_fn)
+            swing_loader = DataLoader(torch.utils.data.Subset(train_dataset, swing_ind), batch_size=args.bsz, shuffle=False, collate_fn=collate_fn)
+            non_robust_loader = DataLoader(torch.utils.data.Subset(train_dataset, non_robust_ind), batch_size=args.bsz, shuffle=False, collate_fn=collate_fn)
+            if args.group == 'robust':
+                train_loader = train_dev_loader = robust_loader
+            elif args.group == 'swing':
+                train_loader = train_dev_loader = swing_loader
+            elif args.group == 'non_robust':
+                train_loader = train_dev_loader = non_robust_loader
 
         if args.do_test:
             #test_dataset = utils.VisionDataset(args, name_or_dataset=args.dataset_name, split='test')
             #test_dataset = CIFAR10(data, train=False, transform=transforms.Compose([transforms.ToTensor()]), download=True)
             test_dataset = load_dataset('cifar10', split='test')
             test_loader = DataLoader(test_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator, sampler=dev_sampler)
+
+        logger.info("train dataset length: "+ str(len(train_dataset)))
+        logger.info("dev dataset length: "+ str(len(dev_dataset)))
+        logger.info("train loader length (approx): "+ str(len(train_loader) * args.bsz))
 
         train_dev_dict = {}
         labels = train_dataset.features["label"].names
@@ -939,13 +1015,16 @@ def finetune(args):
     warmup_steps = num_training_steps * args.warmup_ratio
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, num_training_steps)
 
+    model, optimizer, train_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, scheduler
+    )
     robust_statistics_dict = {}
 
     # num_record_steps = num_training_steps//args.statistic_interval + 1
     # robust_statistics_records = [[] for _ in range(num_record_steps)]
 
     try:
-        import time
+        # import time
         best_accuracy = 0
         global_step = 0
         for epoch in range(args.epochs):
@@ -957,19 +1036,25 @@ def finetune(args):
             for idx, (model_inputs, labels) in enumerate(train_loader):
                 #print(f"model input {model_inputs}, labels {labels}")
                 if args.with_untrained_model:
+                    # print(f"global step {global_step} stat interval {args.statistic_interval} epoch step {epoch_steps} "
+                    #       f"true? {global_step % int(args.statistic_interval * epoch_steps) == 0}")
                     if global_step % int(args.statistic_interval * epoch_steps) == 0:
+                        if args.separate_loss:
+                            separate_loss(train_dataset, epoch, model, args)
                             # and global_step!=0\
 
-                        if args.use_fgsm:
-                            cur_robust_statistics = robust_statistics_fgsm(model, train_dev_loader,
+                        else:
+                            if args.use_fgsm:
+                                cur_robust_statistics = robust_statistics_fgsm(model, train_dev_loader,
                                                                       train_set_len=len(train_dataset), device=device,
                                                                       use_cur_preds=args.use_cur_preds)
-                        else:
-                            cur_robust_statistics = robust_statistics_perturbation(model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
+                            else:
+                                cur_robust_statistics = robust_statistics_perturbation(epoch, model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
                                 #robust_statistics(model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
 
-                        robust_statistics_dict[global_step] = cur_robust_statistics
-                        print('robust stats updated')
+                            robust_statistics_dict[global_step] = cur_robust_statistics
+                        # print('robust stats updated')
+                        # print(robust_statistics_dict.keys())
                 else:
                     if global_step % int(args.statistic_interval * epoch_steps) == 0 and global_step!=0:
                         if args.use_fgsm:
@@ -978,17 +1063,17 @@ def finetune(args):
                                                                            device=device,
                                                                            use_cur_preds=args.use_cur_preds)
                         else:
-                            cur_robust_statistics = robust_statistics_perturbation(model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
+                            cur_robust_statistics = robust_statistics_perturbation(epoch, model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
                                 #robust_statistics(model, train_dev_loader, train_set_len=len(train_dataset), device=device, use_cur_preds=args.use_cur_preds)
                         robust_statistics_dict[global_step] = cur_robust_statistics
                         print('robust stats updated')
 
                 batch_loss=0
-                model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+                # model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
                 model_inputs = model_inputs['pixel_values']
-                labels = labels.to(device)
+                # labels = labels.to(device)
                 model.zero_grad()
-                logits = model(model_inputs,return_dict=False)[0]
+                logits = model(model_inputs, return_dict=False)[0]
                 _, preds = logits.max(dim=-1)
 
                 losses = F.cross_entropy(logits,labels.squeeze(-1))
@@ -996,8 +1081,8 @@ def finetune(args):
 
                 # loss2  = model(**model_inputs,return_dict=False)
                 batch_loss=loss.item()
-                loss.backward()
-
+                # loss.backward()
+                accelerator.backward(loss)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
                 optimizer.step()
@@ -1005,10 +1090,13 @@ def finetune(args):
                 model.zero_grad()
                 avg_loss.update(batch_loss)
 
-                pbar.set_description(f'epoch: {epoch: d}, '
-                                     f'loss: {avg_loss.get_metric(): 0.4f}, '
-                                     f'lr: {optimizer.param_groups[0]["lr"]: .3e}')
                 global_step+=1
+            pbar.set_description(f'epoch: {epoch: d}, '
+                                 f'Transformation: {args.t}, '
+                                 f'loss: {avg_loss.get_metric(): 0.4f}, '
+                                 f'lr: {optimizer.param_groups[0]["lr"]: .3e}')
+            writer.add_scalar(f'{experiment_name}/Train/Loss', loss, epoch)
+
             # s = Path(str(output_dir) + '/epoch' + str(epoch))
             # if not s.exists():
             #     s.mkdir(parents=True)
@@ -1028,10 +1116,17 @@ def finetune(args):
                         labels = labels.to(device)
                         logits = model(model_inputs,return_dict=False)[0]
                         _, preds = logits.max(dim=-1)
+
+                        losses = F.cross_entropy(logits,labels.squeeze(-1))
+                        loss = torch.mean(losses)
+                        batch_loss=loss.item()
+                        avg_loss.update(batch_loss)
+
                         correct += (preds == labels.squeeze(-1)).sum().item()
                         total += labels.size(0)
-                    accuracy = correct / (total + 1e-13)
+                    accuracy = 100 * correct / (total + 1e-13)
                 logger.info(f'Epoch: {epoch}, '
+                            f'Transformation: {args.t}, '
                             f'Loss: {avg_loss.get_metric(): 0.4f}, '
                             f'Lr: {optimizer.param_groups[0]["lr"]: .3e}, '
                             f'Accuracy: {accuracy}')
@@ -1045,6 +1140,59 @@ def finetune(args):
                     best_dev_epoch = epoch
 
             logger.info(f'Best dev metric: {best_accuracy} in Epoch: {best_dev_epoch}')
+            writer.add_scalar(f'{experiment_name}/Test/Loss', loss, epoch)
+
+            if args.do_robustness and not args.cal_time:
+                logger.info('Calculating robustness...')
+                model.eval()
+                correct = 0
+                total = 0
+                func = globals()[args.t]
+                t_min, t_max = get_t_range(args.t)
+                intensity = t_min + epoch * (t_max - t_min) / 10
+                with torch.no_grad():
+                    for model_inputs, labels in dev_loader:
+                        model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+                        model_inputs = model_inputs['pixel_values']
+                        labels = labels.to(device)
+
+                        transformed_batch = torch.empty_like(model_inputs)
+                        for i in range(model_inputs.shape[0]):
+                            transformed = func((255*model_inputs[i].permute(1, 2, 0).detach().cpu().numpy()).astype(np.uint8), intensity)
+                            # if i == 0:
+                                # print((256*np.array(input_ids[i].permute(1, 2, 0).detach().cpu())).astype(np.uint8))
+                                # print(f'******{transformed}******')
+                                # writer.add_image(f"original_{args.t}_{intensity}", model_inputs[i])
+                                # writer.add_image(f"transformed_{args.t}_{intensity}", transforms.ToTensor()(transformed))
+                            transformed_batch[i] = torch.from_numpy(transformed).permute(2, 0, 1)
+                        batch = {'pixel_values': transformed_batch}
+
+                        logits = model(**batch, return_dict=False)[0]
+                        _, preds = logits.max(dim=-1)
+                        losses = F.cross_entropy(logits, labels.squeeze(-1))
+                        loss = torch.mean(losses)
+                        batch_loss=loss.item()
+                        avg_loss.update(batch_loss)
+
+                        correct += (preds == labels.squeeze(-1)).sum().item()
+                        total += labels.size(0)
+                    accuracy = 100 * correct / (total + 1e-13)
+                logger.info(f'Epoch: {epoch}, '
+                            f'Transformation: {args.t}, '
+                            f'Loss: {avg_loss.get_metric(): 0.4f}, '
+                            f'Lr: {optimizer.param_groups[0]["lr"]: .3e}, '
+                            f'Robustness: {accuracy}')
+                #
+                if accuracy > best_accuracy:
+                    logger.info('Best robustness so far.')
+                    # model.save_pretrained(output_dir)
+                    # tokenizer.save_pretrained(output_dir)
+                    # torch.save(args, os.path.join(output_dir, "training_args.bin"))
+                    best_accuracy = accuracy
+                    best_dev_epoch = epoch
+
+            logger.info(f'Best robustness: {best_accuracy} in Epoch: {best_dev_epoch}')
+            # writer.add_scalar(f'{experiment_name}/Test/Loss', loss, epoch)
 
         # save statistics
 
@@ -1060,15 +1208,21 @@ def finetune(args):
                             ),
                     robust_statistics_dict)
             else:
-                np.save('robust_statistics_model{}_dataset{}_task{}_seed{}_shuffle{}_len{}_adv_steps{}_adv_lr{}_epoch{}_lr{}_interval{}_with_untrained_model{}_use_cur_preds{}.npy'
-                        .format(args.model_name.split('/')[-1],args.dataset_name,args.task_name,args.seed,args.do_train_shuffle,
-                                args.dataset_len,
-                                args.adv_steps,args.adv_lr,args.epochs,args.lr,
-                                args.statistic_interval,args.with_untrained_model,args.use_cur_preds
-                                ),
+                if not args.separate_loss:
+                    np.save(f'{experiment_name}.npy',
+                    #'robust_statistics_model{}_dataset{}_task{}_seed{}_shuffle{}_len{}_adv_steps{}_adv_lr{}_epoch{}_lr{}_interval{}_with_untrained_model{}_use_cur_preds{}.npy'
+                        # .format(args.model_name.split('/')[-1],args.dataset_name,args.task_name,args.seed,args.do_train_shuffle,
+                        #         args.dataset_len,
+                        #         args.adv_steps,args.adv_lr,args.epochs,args.lr,
+                        #         args.statistic_interval,args.with_untrained_model,args.use_cur_preds
+                                #),
                         robust_statistics_dict)
         else:
-            np.save(args.output_dir,robust_statistics_dict)
+            if not args.separate_loss:
+                np.save(f'{experiment_name}.npy', robust_statistics_dict)
+            # with open('test_dict.txt', 'w') as f:
+            #     f.write(json.dumps(robust_statistics_dict))
+
     except KeyboardInterrupt:
         logger.info('Interrupted...')
 
