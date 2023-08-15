@@ -128,7 +128,7 @@ def parse_args():
                         help='change rate of a sentence')
     parser.add_argument('--max_grad_norm', default=1, type=float, help='max gradient norm')
     parser.add_argument('--use_fgsm', default=0, type=float, help='')
-    parser.add_argument('--separate_loss', default=True, type=bool, help='log loss based on sample robustness')
+    parser.add_argument('--separate_loss', default=False, type=bool, help='log loss based on sample robustness')
     parser.add_argument('--set_percentage', default=None, type=float, help='what percentage of data should be used (based on robustness -- table 1)')
     parser.add_argument('--group', default=None, help='robustness group to be used for training')
     parser.add_argument('--do_robustness', action='store_true', help='do robustness testing')
@@ -148,12 +148,14 @@ def parse_args():
         args.ckpt_dir = '.'
     return args
 
+
 def set_seed(seed: int):
     """Sets the relevant random seeds."""
     random.seed(seed)
     np.random.seed(seed)
     torch.random.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+
 
 def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
     """ Create a schedule with a learning rate that decreases linearly after
@@ -604,7 +606,7 @@ def calc_loss(loader, epoch, model, name, args):
     model.train()
     func = globals()[args.t]
     t_min, t_max = get_t_range(args.t)
-    t_max = t_max / 2
+    # t_max = t_max / 2
     intensity = t_min + epoch * (t_max - t_min) / 10
     experiment_name = f'{args.dataset_name}_epochs_{args.epochs}_lr_{args.lr}_bsz_{args.bsz}_t_{args.t}_dynamic'
 
@@ -1066,7 +1068,7 @@ def finetune(args):
                             cur_robust_statistics = robust_statistics_perturbation(epoch, model,train_dev_loader,train_set_len=len(train_dataset),device=device,use_cur_preds=args.use_cur_preds)
                                 #robust_statistics(model, train_dev_loader, train_set_len=len(train_dataset), device=device, use_cur_preds=args.use_cur_preds)
                         robust_statistics_dict[global_step] = cur_robust_statistics
-                        print('robust stats updated')
+                        # print('robust stats updated')
 
                 batch_loss=0
                 # model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
@@ -1095,7 +1097,7 @@ def finetune(args):
                                  f'Transformation: {args.t}, '
                                  f'loss: {avg_loss.get_metric(): 0.4f}, '
                                  f'lr: {optimizer.param_groups[0]["lr"]: .3e}')
-            writer.add_scalar(f'{experiment_name}/Train/Loss', loss, epoch)
+            writer.add_scalar(f'{experiment_name}/Train/Loss', avg_loss.get_metric(), epoch)
 
             # s = Path(str(output_dir) + '/epoch' + str(epoch))
             # if not s.exists():
@@ -1139,62 +1141,49 @@ def finetune(args):
                     best_accuracy = accuracy
                     best_dev_epoch = epoch
 
-            logger.info(f'Best dev metric: {best_accuracy} in Epoch: {best_dev_epoch}')
-            writer.add_scalar(f'{experiment_name}/Test/Loss', loss, epoch)
+                logger.info(f'Best dev metric: {best_accuracy} in Epoch: {best_dev_epoch}')
+                writer.add_scalar(f'{experiment_name}/Test/Loss', avg_loss.get_metric(), epoch)
 
-            if args.do_robustness and not args.cal_time:
-                logger.info('Calculating robustness...')
-                model.eval()
-                correct = 0
-                total = 0
-                func = globals()[args.t]
-                t_min, t_max = get_t_range(args.t)
-                intensity = t_min + epoch * (t_max - t_min) / 10
-                with torch.no_grad():
-                    for model_inputs, labels in dev_loader:
-                        model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
-                        model_inputs = model_inputs['pixel_values']
-                        labels = labels.to(device)
+        if args.do_robustness and not args.cal_time:
+            logger.info('Calculating robustness...')
+            model.eval()
+            correct = 0
+            total = 0
+            func = globals()[args.t]
+            t_min, t_max = get_t_range(args.t)
+            # intensity = t_min + epoch * (t_max - t_min) / 10
+            intensity = (t_min + t_max) / 2
+            with torch.no_grad():
+                for model_inputs, labels in dev_loader:
+                    model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+                    model_inputs = model_inputs['pixel_values']
+                    labels = labels.to(device)
 
-                        transformed_batch = torch.empty_like(model_inputs)
-                        for i in range(model_inputs.shape[0]):
-                            transformed = func((255*model_inputs[i].permute(1, 2, 0).detach().cpu().numpy()).astype(np.uint8), intensity)
-                            # if i == 0:
-                                # print((256*np.array(input_ids[i].permute(1, 2, 0).detach().cpu())).astype(np.uint8))
-                                # print(f'******{transformed}******')
-                                # writer.add_image(f"original_{args.t}_{intensity}", model_inputs[i])
-                                # writer.add_image(f"transformed_{args.t}_{intensity}", transforms.ToTensor()(transformed))
-                            transformed_batch[i] = torch.from_numpy(transformed).permute(2, 0, 1)
-                        batch = {'pixel_values': transformed_batch}
+                    transformed_batch = torch.empty_like(model_inputs)
+                    for i in range(model_inputs.shape[0]):
+                        transformed = func((255*model_inputs[i].permute(1, 2, 0).detach().cpu().numpy()).astype(np.uint8), intensity)
+                        # if i == 0:
+                            # print((256*np.array(input_ids[i].permute(1, 2, 0).detach().cpu())).astype(np.uint8))
+                            # print(f'******{transformed}******')
+                            # writer.add_image(f"original_{args.t}_{intensity}", model_inputs[i])
+                            # writer.add_image(f"transformed_{args.t}_{intensity}", transforms.ToTensor()(transformed))
+                        transformed_batch[i] = torch.from_numpy(transformed).permute(2, 0, 1)
+                    batch = {'pixel_values': transformed_batch}
 
-                        logits = model(**batch, return_dict=False)[0]
-                        _, preds = logits.max(dim=-1)
-                        losses = F.cross_entropy(logits, labels.squeeze(-1))
-                        loss = torch.mean(losses)
-                        batch_loss=loss.item()
-                        avg_loss.update(batch_loss)
+                    logits = model(**batch, return_dict=False)[0]
+                    _, preds = logits.max(dim=-1)
+                    losses = F.cross_entropy(logits, labels.squeeze(-1))
+                    loss = torch.mean(losses)
+                    batch_loss=loss.item()
+                    avg_loss.update(batch_loss)
 
-                        correct += (preds == labels.squeeze(-1)).sum().item()
-                        total += labels.size(0)
-                    accuracy = 100 * correct / (total + 1e-13)
-                logger.info(f'Epoch: {epoch}, '
-                            f'Transformation: {args.t}, '
-                            f'Loss: {avg_loss.get_metric(): 0.4f}, '
-                            f'Lr: {optimizer.param_groups[0]["lr"]: .3e}, '
-                            f'Robustness: {accuracy}')
-                #
-                if accuracy > best_accuracy:
-                    logger.info('Best robustness so far.')
-                    # model.save_pretrained(output_dir)
-                    # tokenizer.save_pretrained(output_dir)
-                    # torch.save(args, os.path.join(output_dir, "training_args.bin"))
-                    best_accuracy = accuracy
-                    best_dev_epoch = epoch
-
-            logger.info(f'Best robustness: {best_accuracy} in Epoch: {best_dev_epoch}')
-            # writer.add_scalar(f'{experiment_name}/Test/Loss', loss, epoch)
-
-        # save statistics
+                    correct += (preds == labels.squeeze(-1)).sum().item()
+                    total += labels.size(0)
+                accuracy = 100 * correct / (total + 1e-13)
+            logger.info(f'Transformation: {args.t}, '
+                        # f'Loss: {avg_loss.get_metric(): 0.4f}, '
+                        # f'Lr: {optimizer.param_groups[0]["lr"]: .3e}, '
+                        f'Robustness: {accuracy}')
 
 
         if args.output_dir=='/root/tmp_dir':

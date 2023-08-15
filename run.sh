@@ -10,11 +10,17 @@ transformations=("blur" "shot_noise" "rotate" "random_shadow" "sharpen_and_darke
 #                                 "edge" "inverted_edge")
 #
 
+groups="robust non_robust swing"
 for t in ${transformations[@]}
 do
-   accelerate launch data_statistics.py --epochs 10 --bsz 64 -t $t
+#  for g in ${groups[@]}
+#  do
+   CUDA_VISIBLE_DEVICES="1,2,3" accelerate launch data_statistics.py --epochs 10 --bsz 64 -t $t
+   #--set_percentage 0.5 --group $g --do_robustness
    cd plot_utils
    python plotting.py --exp "cifar10_epochs_10_lr_2e-05_bsz_64_t_"$t"_dynamic"
    cd ../
 
+#  done
 done
+

@@ -47,7 +47,10 @@ def dataset_to_length_and_batch_size(dataset_name="glue",task_name="sst2"):
         len_dataset = 120000
         per_device_batch_size = 32
         return len_dataset,per_device_batch_size
-
+    elif dataset_name == "cifar10":
+        len_dataset = 50000
+        per_device_batch_size = 32
+        return len_dataset, per_device_batch_size
     elif dataset_name == "glue":
         if task_name == "sst2" or task_name == "sst-2":
             len_dataset = 67349
