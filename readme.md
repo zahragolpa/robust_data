@@ -84,18 +84,24 @@ Note that different perturbations resulted in different patterns. Here are a few
 
 
 Rotate:
+
+
 ![image](https://github.com/zahragolpa/robust_data/assets/20627999/23d5740c-c21c-4bb4-bd93-c13108099ca6)
 
 
 
 
 Shot noise:
+
+
 ![image](https://github.com/zahragolpa/robust_data/assets/20627999/1c9f6107-a196-40ad-9336-698adc1a191f)
 
 
 
 
 Red shift:
+
+
 ![image](https://github.com/zahragolpa/robust_data/assets/20627999/53bc61ff-e4bc-45c9-9280-b9f4616dd537)
 
 
@@ -104,21 +110,41 @@ Red shift:
 We also visualized the robust, swing, and non-robust samples:
 
 robust samples:
+
+
 ![image](https://github.com/zahragolpa/robust_data/assets/20627999/5f39782c-3ada-4bbb-a838-820f4b68c899)
 
+
+
 swing samples:
+
+
 ![image](https://github.com/zahragolpa/robust_data/assets/20627999/98f2a091-543e-4aa4-a7d0-9116e9e59034)
 
+
+
 non-robust samples:
+
+
 ![image](https://github.com/zahragolpa/robust_data/assets/20627999/6813b263-85dd-4ee9-b20d-f65cef6d257a)
+
+
 
 Unlike the original paper, training on the 50% most robust samples did not result in over-fitting, hence, their work was not reproduced on image data:
 
 Training on cifar10 with Blur transformation, train loss:
+
+
 <img width="731" alt="image" src="https://github.com/zahragolpa/robust_data/assets/20627999/204f26ff-628c-43d4-9da9-b47324e36ed2">
 
+
+
+
 Training on cifar10 with Blur transformation, test loss:
+
 <img width="709" alt="image" src="https://github.com/zahragolpa/robust_data/assets/20627999/b397455d-6c90-4152-9b42-097d99192f55">
+
+
 
 We also tried adversarial attacks instead of image perturbations and experimented with a variety of transformation intensities (weak, medium, strong), but none of them reproduced the results from the paper.
 
